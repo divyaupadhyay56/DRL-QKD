@@ -1,27 +1,3 @@
-"""
-traffic.py
-==========
-Dynamic traffic + channel model for the QKD-enabled SS-EON.
-
-Implements:
-  - Section 3: each request is a triplet (QC, CC, DC).
-        QC -> 1 slot, CC -> 1 slot, DC -> modulation/capacity dependent.
-  - Section 4: dynamic requests with a uniformly random (src, dst) pair,
-        data demand from capacity classes {50,100,...,400} Gbps,
-        exponential holding time (mean H), Poisson arrivals (rate lambda);
-        offered load rho = lambda * H Erlangs.
-  - Section 7 (DC): modulation format from route distance -> DC slot count.
-
-This mirrors the dynamic request loop in the user's main1.py (Poisson arrival
-times, exponential holding times, random s-d pairs) and the distance->bitrate
-slot derivation in functions.calculateRequiredSlots.
-
-References (uploaded by the user):
-  - implementation_v2.docx ....... spec (Sections 3, 4, 7).
-  - main1.py ..................... user's dynamic request generation loop.
-  - functions.py ................. user's BitRateAndDistances / required-slots.
-"""
-
 import numpy as np
 
 

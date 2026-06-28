@@ -1,32 +1,3 @@
-"""
-topology.py
-===========
-Network model for the QKD-enabled SS-EON over multi-core fiber (MCF).
-
-Implements Section 2 ("Network Model") of implementation_v2:
-  - Network = Tokyo12 MAN network (12 optical cross-connect nodes).
-  - Directed graph; links are multi-core fiber connections.
-  - Inter-core adjacency matrix describing which cores are physically
-    neighbouring (used for crosstalk relationships). Scope hook is left to
-    extend with an inter-mode crosstalk dimension (single mode per core here,
-    so every core is purely a spatial channel).
-  - 5 cores per link, 2 quantum-dedicated cores (set C_Q), 320 slots per core.
-
-References (uploaded by the user):
-  - implementation_v2.docx ....... authoritative specification (Sections 2, 6).
-  - graph_functions.py ........... user's networkGraph / k-shortest-path code
-                                   (this file extends that pattern to MCF).
-  - DeepRMSA_Aorks_2.pdf ......... DeepRMSA (graph + k-SP routing reference).
-  - IET_Quantum_Communication_2023_Sharma .. DRL routing/resource assignment
-                                   in quantum networks (topology reference).
-  - shrasti_noms2026_qkd_1.pdf ... NOMS-2026 QKD routing paper (QKD core model).
-
-NOTE ON DISTANCES: the Tokyo12 / Japanese 12-node (JPN12) link set below is the
-standard metropolitan backbone used in the literature. Replace the km values in
-`TOKYO12_LINKS` with your exact Tokyo12 distance matrix if it differs; the rest
-of the code reads them from here and needs no other change.
-"""
-
 import networkx as nx
 
 

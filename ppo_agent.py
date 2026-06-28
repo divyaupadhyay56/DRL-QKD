@@ -1,28 +1,3 @@
-"""
-ppo_agent.py
-============
-PPO agent for the QKD-enabled SS-EON allocation environment.
-
-Implements Section 10 of implementation_v2:
-  - Algorithm: PPO (chosen over DeepRMSA's A3C). The clipped surrogate
-    objective provides training stability, so DeepRMSA's window-based (FLX)
-    mechanism is not used.
-  - Designed for the offline-then-online schedule driven from main.py
-    (pre-train on the simulator, then fine-tune online).
-
-Built with TensorFlow/Keras to stay consistent with the user's DQN.py
-(tf.keras Sequential models, Adam optimiser, .save() checkpoints). Action
-masking from the environment is applied to the policy logits so every executed
-action is physically secure (Section 9).
-
-References (uploaded by the user):
-  - implementation_v2.docx ....... spec (Section 10).
-  - DQN.py ....................... user's tf.keras agent (network/optimiser style).
-  - DeepRMSA_Agent.py (github.com/xiaoliangchenUCD/DeepRMSA) .. A3C agent the
-                                   PPO design is contrasted against.
-  - DeepRMSA_Aorks_2.pdf ......... DeepRMSA paper (DRL-for-RMSA reference).
-"""
-
 import numpy as np
 import tensorflow as tf
 
