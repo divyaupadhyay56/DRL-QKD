@@ -1,97 +1,106 @@
 """
-Dynamic traffic generation (Section 4 of implementation_v2).
+traffic.py
+==========
+Dynamic traffic + channel model for the QKD-enabled SS-EON.
 
-Each request is a triplet (QC, CC, DC) with:
-  - a uniformly random source/destination pair,
-  - a data demand drawn from the capacity classes {50,...,400} Gbps,
-  - an exponentially distributed holding time (mean H),
-  - arrivals following a Poisson process of rate lambda.
+Implements:
+  - Section 3: each request is a triplet (QC, CC, DC).
+        QC -> 1 slot, CC -> 1 slot, DC -> modulation/capacity dependent.
+  - Section 4: dynamic requests with a uniformly random (src, dst) pair,
+        data demand from capacity classes {50,100,...,400} Gbps,
+        exponential holding time (mean H), Poisson arrivals (rate lambda);
+        offered load rho = lambda * H Erlangs.
+  - Section 7 (DC): modulation format from route distance -> DC slot count.
 
-The generator is event-driven and supports a mid-run change of the traffic
-distribution, used by the robustness evaluation (Section 10).
+This mirrors the dynamic request loop in the user's main1.py (Poisson arrival
+times, exponential holding times, random s-d pairs) and the distance->bitrate
+slot derivation in functions.calculateRequiredSlots.
+
+References (uploaded by the user):
+  - implementation_v2.docx ....... spec (Sections 3, 4, 7).
+  - main1.py ..................... user's dynamic request generation loop.
+  - functions.py ................. user's BitRateAndDistances / required-slots.
 """
-
-from dataclasses import dataclass
-from typing import List, Optional
 
 import numpy as np
 
 
-@dataclass
-class Request:
-    rid: int
-    src: int
-    dst: int
-    demand: int                 # data-channel demand in Gbps
-    arrival_time: float
-    holding_time: float
+# Section 4: data demand capacity classes (Gbps).
+CAPACITY_CLASSES = [50, 100, 150, 200, 250, 300, 350, 400]
 
-    @property
-    def departure_time(self) -> float:
-        return self.arrival_time + self.holding_time
+# Section 3: fixed single-slot quantum and companion channels.
+QC_SLOTS = 1
+CC_SLOTS = 1
+
+# Slot width (GHz). Standard flexible-grid granularity.
+SLOT_WIDTH_GHZ = 12.5
+
+# Section 7: distance-dependent modulation format -> spectral efficiency
+# (bits/symbol). Longer reach -> lower-order modulation -> more slots.
+# Same distance-banding idea as functions.BitRateAndDistances, expressed as
+# modulation efficiency. Distances are in km.
+MODULATION_BY_DISTANCE = [
+    (0,    500,   4),   # 16-QAM   : 4 bits/symbol
+    (500,  1000,  3),   # 8-QAM    : 3 bits/symbol
+    (1000, 2000,  2),   # QPSK     : 2 bits/symbol
+    (2000, 1e9,   1),   # BPSK     : 1 bit/symbol
+]
+
+
+def modulation_efficiency(distance_km):
+    """Bits/symbol for a route of the given length (Section 7)."""
+    for lo, hi, bits in MODULATION_BY_DISTANCE:
+        if lo <= distance_km < hi:
+            return bits
+    return MODULATION_BY_DISTANCE[-1][2]
+
+
+def dc_slot_count(demand_gbps, distance_km):
+    """DC slot count from capacity class + modulation format (Section 7).
+
+    slots = ceil( demand / (bits_per_symbol * slot_width) ).
+    The 1-slot guard band (Section 5) is applied at allocation time in
+    mcf_resources, not added here.
+    """
+    bits = modulation_efficiency(distance_km)
+    return int(np.ceil(demand_gbps / (bits * SLOT_WIDTH_GHZ)))
 
 
 class TrafficGenerator:
-    """Produces a stream of requests with exponential inter-arrival / holding."""
+    """Poisson arrivals + exponential holding times of (QC, CC, DC) triplets."""
 
-    def __init__(self, num_nodes: int, capacity_classes: List[int],
-                 arrival_rate: float, mean_holding_time: float, seed: int = 0):
-        self.num_nodes = num_nodes
-        self.capacity_classes = list(capacity_classes)
-        self.arrival_rate = arrival_rate
-        self.mean_holding_time = mean_holding_time
+    def __init__(self, nodes, arrival_rate, holding_mean,
+                 capacity_classes=None, seed=None):
+        self.nodes = list(nodes)
+        self.arrival_rate = arrival_rate          # lambda
+        self.holding_mean = holding_mean          # H
+        self.capacity_classes = capacity_classes or CAPACITY_CLASSES
         self.rng = np.random.default_rng(seed)
 
-        self._clock = 0.0
-        self._next_id = 0
-        # Optional non-uniform source/destination weights for the robustness test.
-        self._node_weights: Optional[np.ndarray] = None
-
-    # ---- distribution control -----------------------------------------------
-    def set_uniform(self):
-        """Uniform traffic distribution (the default)."""
-        self._node_weights = None
-
-    def set_nonuniform(self, concentration: float = 4.0):
-        """Skew the src/dst distribution toward a subset of hot nodes.
-
-        This implements the mid-run traffic shift used to check that the policy
-        is not overfit to a single traffic pattern (Section 10)."""
-        w = self.rng.random(self.num_nodes) ** concentration
-        self._node_weights = w / w.sum()
-
-    def set_load(self, arrival_rate: float = None, mean_holding_time: float = None):
-        if arrival_rate is not None:
-            self.arrival_rate = arrival_rate
-        if mean_holding_time is not None:
-            self.mean_holding_time = mean_holding_time
-
-    # ---- sampling ------------------------------------------------------------
-    def _sample_pair(self):
-        if self._node_weights is None:
-            src, dst = self.rng.choice(self.num_nodes, size=2, replace=False)
-        else:
-            src, dst = self.rng.choice(self.num_nodes, size=2, replace=False,
-                                       p=self._node_weights)
-        return int(src), int(dst)
-
-    def next_request(self) -> Request:
-        # Poisson process: exponential inter-arrival time.
-        self._clock += self.rng.exponential(1.0 / self.arrival_rate)
-        src, dst = self._sample_pair()
-        demand = int(self.rng.choice(self.capacity_classes))
-        holding = float(self.rng.exponential(self.mean_holding_time))
-        req = Request(self._next_id, src, dst, demand, self._clock, holding)
-        self._next_id += 1
-        return req
-
     @property
-    def offered_load(self) -> float:
-        """rho = lambda * H Erlangs."""
-        return self.arrival_rate * self.mean_holding_time
+    def offered_load(self):
+        """rho = lambda * H Erlangs (Section 4)."""
+        return self.arrival_rate * self.holding_mean
 
-    def reset(self, seed: Optional[int] = None):
-        if seed is not None:
-            self.rng = np.random.default_rng(seed)
-        self._clock = 0.0
-        self._next_id = 0
+    def generate(self, num_requests):
+        """Yield request dicts in arrival order.
+
+        Inter-arrival times ~ Exponential(1/lambda) (a Poisson process);
+        holding times ~ Exponential(mean = H).
+        """
+        t = 0.0
+        for rid in range(num_requests):
+            t += self.rng.exponential(1.0 / self.arrival_rate)
+            holding = self.rng.exponential(self.holding_mean)
+            src, dst = self.rng.choice(self.nodes, size=2, replace=False)
+            demand = int(self.rng.choice(self.capacity_classes))
+            yield {
+                "id": rid,
+                "src": int(src),
+                "dst": int(dst),
+                "arrival": t,
+                "holding": holding,
+                "demand": demand,     # DC data demand (Gbps)
+                "qc_slots": QC_SLOTS,
+                "cc_slots": CC_SLOTS,
+            }

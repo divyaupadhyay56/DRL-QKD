@@ -1,136 +1,162 @@
 """
-PPO agent (Section 10 of implementation_v2).
+ppo_agent.py
+============
+PPO agent for the QKD-enabled SS-EON allocation environment.
 
-"Algorithm: PPO. ... its clipped objective provides training stability, so the
-window-based (FLX) mechanism of DeepRMSA is not needed."
+Implements Section 10 of implementation_v2:
+  - Algorithm: PPO (chosen over DeepRMSA's A3C). The clipped surrogate
+    objective provides training stability, so DeepRMSA's window-based (FLX)
+    mechanism is not used.
+  - Designed for the offline-then-online schedule driven from main.py
+    (pre-train on the simulator, then fine-tune online).
 
-A shared-trunk actor-critic network with action masking: the infeasible
-(route, core) options identified by the environment are masked out of the policy
-logits before sampling, so every executed allocation is physically secure.
+Built with TensorFlow/Keras to stay consistent with the user's DQN.py
+(tf.keras Sequential models, Adam optimiser, .save() checkpoints). Action
+masking from the environment is applied to the policy logits so every executed
+action is physically secure (Section 9).
+
+References (uploaded by the user):
+  - implementation_v2.docx ....... spec (Section 10).
+  - DQN.py ....................... user's tf.keras agent (network/optimiser style).
+  - DeepRMSA_Agent.py (github.com/xiaoliangchenUCD/DeepRMSA) .. A3C agent the
+                                   PPO design is contrasted against.
+  - DeepRMSA_Aorks_2.pdf ......... DeepRMSA paper (DRL-for-RMSA reference).
 """
 
-from typing import List
-
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.distributions import Categorical
+import tensorflow as tf
 
-NEG_INF = -1e9
-
-
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, hidden_sizes: List[int]):
-        super().__init__()
-        layers, last = [], obs_dim
-        for h in hidden_sizes:
-            layers += [nn.Linear(last, h), nn.Tanh()]
-            last = h
-        self.trunk = nn.Sequential(*layers)
-        self.policy_head = nn.Linear(last, action_dim)
-        self.value_head = nn.Linear(last, 1)
-
-    def forward(self, obs):
-        z = self.trunk(obs)
-        return self.policy_head(z), self.value_head(z).squeeze(-1)
-
-    @staticmethod
-    def _masked_logits(logits, mask):
-        # mask: 1.0 for feasible actions, 0.0 otherwise.
-        return torch.where(mask > 0, logits, torch.full_like(logits, NEG_INF))
-
-    def distribution(self, obs, mask):
-        logits, value = self.forward(obs)
-        return Categorical(logits=self._masked_logits(logits, mask)), value
+NEG_INF = -1e9   # logit value for masked (infeasible) actions.
 
 
 class PPOAgent:
-    def __init__(self, obs_dim, action_dim, cfg, device="cpu"):
-        self.cfg = cfg
-        self.device = torch.device(device)
-        self.net = ActorCritic(obs_dim, action_dim, cfg.drl.hidden_sizes).to(self.device)
-        self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.drl.lr)
-        self.action_dim = action_dim
+    def __init__(self, state_size, action_size,
+                 gamma=0.99, lam=0.95, clip_ratio=0.2,
+                 actor_lr=3e-4, critic_lr=1e-3,
+                 train_iters=4):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.gamma = gamma
+        self.lam = lam
+        self.clip_ratio = clip_ratio
+        self.train_iters = train_iters
 
-    # ---- acting --------------------------------------------------------------
-    @torch.no_grad()
-    def act(self, obs, mask, greedy: bool = False):
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        mask_t = torch.as_tensor(mask, dtype=torch.float32, device=self.device).unsqueeze(0)
-        dist, value = self.net.distribution(obs_t, mask_t)
-        if greedy:
-            action = torch.argmax(dist.probs, dim=-1)
-        else:
-            action = dist.sample()
-        return int(action.item()), float(dist.log_prob(action).item()), float(value.item())
+        self.actor = self._build_actor()
+        self.critic = self._build_critic()
+        self.actor_opt = tf.keras.optimizers.Adam(learning_rate=actor_lr)
+        self.critic_opt = tf.keras.optimizers.Adam(learning_rate=critic_lr)
 
-    # ---- GAE -----------------------------------------------------------------
-    def _compute_gae(self, rewards, values, dones, last_value):
-        adv = np.zeros_like(rewards, dtype=np.float32)
+        self._buffer = []   # rollout: (state, action, logp, reward, value, mask)
+
+    # ------------------------------------------------------------- networks
+    def _build_actor(self):
+        # Hidden-layer pattern follows DQN.py (relu stack -> logits head).
+        model = tf.keras.Sequential([
+            tf.keras.layers.Input(shape=(self.state_size,)),
+            tf.keras.layers.Dense(128, activation="relu"),
+            tf.keras.layers.Dense(128, activation="relu"),
+            tf.keras.layers.Dense(64, activation="relu"),
+            tf.keras.layers.Dense(self.action_size, activation="linear"),
+        ])
+        return model
+
+    def _build_critic(self):
+        model = tf.keras.Sequential([
+            tf.keras.layers.Input(shape=(self.state_size,)),
+            tf.keras.layers.Dense(128, activation="relu"),
+            tf.keras.layers.Dense(128, activation="relu"),
+            tf.keras.layers.Dense(64, activation="relu"),
+            tf.keras.layers.Dense(1, activation="linear"),
+        ])
+        return model
+
+    # ---------------------------------------------------- masked policy ----
+    def _masked_logits(self, states, masks):
+        logits = self.actor(states)
+        masks = tf.cast(masks, tf.float32)
+        return logits + (1.0 - masks) * NEG_INF
+
+    def act(self, state, mask):
+        """Sample a feasible action; return (action, log_prob, value)."""
+        s = state[None, :]
+        m = mask[None, :]
+        logits = self._masked_logits(s, m)
+        logp_all = tf.nn.log_softmax(logits)
+        probs = tf.exp(logp_all)[0].numpy()
+        total = probs.sum()
+        if not np.isfinite(total) or total <= 0:
+            # No feasible action -> forced block handled by the environment.
+            return int(np.argmax(mask)), 0.0, float(self.critic(s)[0, 0])
+        probs = probs / total
+        action = int(np.random.choice(self.action_size, p=probs))
+        logp = float(logp_all[0, action].numpy())
+        value = float(self.critic(s)[0, 0])
+        return action, logp, value
+
+    # ----------------------------------------------------- rollout buffer --
+    def remember(self, state, action, logp, reward, value, mask):
+        self._buffer.append((state, action, logp, reward, value, mask))
+
+    def _compute_gae(self, rewards, values, last_value):
+        """Generalised Advantage Estimation."""
+        adv = np.zeros(len(rewards), dtype=np.float32)
         gae = 0.0
-        gamma, lam = self.cfg.drl.gamma, self.cfg.drl.gae_lambda
         for t in reversed(range(len(rewards))):
-            next_value = last_value if t == len(rewards) - 1 else values[t + 1]
-            next_nonterminal = 1.0 - dones[t]
-            delta = rewards[t] + gamma * next_value * next_nonterminal - values[t]
-            gae = delta + gamma * lam * next_nonterminal * gae
+            next_v = last_value if t == len(rewards) - 1 else values[t + 1]
+            delta = rewards[t] + self.gamma * next_v - values[t]
+            gae = delta + self.gamma * self.lam * gae
             adv[t] = gae
-        returns = adv + values
+        returns = adv + np.asarray(values, dtype=np.float32)
         return adv, returns
 
-    # ---- learning ------------------------------------------------------------
-    def update(self, batch, last_value: float):
-        obs = torch.as_tensor(np.asarray(batch["obs"]), dtype=torch.float32, device=self.device)
-        masks = torch.as_tensor(np.asarray(batch["mask"]), dtype=torch.float32, device=self.device)
-        actions = torch.as_tensor(np.asarray(batch["action"]), dtype=torch.long, device=self.device)
-        old_logp = torch.as_tensor(np.asarray(batch["logp"]), dtype=torch.float32, device=self.device)
+    # ------------------------------------------------ Section 10: PPO update
+    def train(self, last_value=0.0):
+        if not self._buffer:
+            return None
+        states = np.array([b[0] for b in self._buffer], dtype=np.float32)
+        actions = np.array([b[1] for b in self._buffer], dtype=np.int32)
+        old_logp = np.array([b[2] for b in self._buffer], dtype=np.float32)
+        rewards = [b[3] for b in self._buffer]
+        values = [b[4] for b in self._buffer]
+        masks = np.array([b[5] for b in self._buffer], dtype=np.float32)
 
-        rewards = np.asarray(batch["reward"], dtype=np.float32)
-        values = np.asarray(batch["value"], dtype=np.float32)
-        dones = np.asarray(batch["done"], dtype=np.float32)
-        adv_np, ret_np = self._compute_gae(rewards, values, dones, last_value)
-        adv = torch.as_tensor(adv_np, device=self.device)
-        returns = torch.as_tensor(ret_np, device=self.device)
+        adv, returns = self._compute_gae(rewards, values, last_value)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        n = obs.shape[0]
-        idx = np.arange(n)
-        mb = self.cfg.drl.minibatch_size
-        stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "n": 0}
+        idx = np.arange(self.action_size)
+        actor_losses, critic_losses = [], []
+        for _ in range(self.train_iters):
+            with tf.GradientTape() as tape:
+                logits = self._masked_logits(states, masks)
+                logp_all = tf.nn.log_softmax(logits)
+                onehot = tf.one_hot(actions, self.action_size)
+                logp = tf.reduce_sum(onehot * logp_all, axis=1)
+                ratio = tf.exp(logp - old_logp)
+                clipped = tf.clip_by_value(
+                    ratio, 1 - self.clip_ratio, 1 + self.clip_ratio)
+                actor_loss = -tf.reduce_mean(
+                    tf.minimum(ratio * adv, clipped * adv))
+            grads = tape.gradient(actor_loss, self.actor.trainable_variables)
+            self.actor_opt.apply_gradients(
+                zip(grads, self.actor.trainable_variables))
+            actor_losses.append(float(actor_loss))
 
-        for _ in range(self.cfg.drl.update_epochs):
-            np.random.shuffle(idx)
-            for start in range(0, n, mb):
-                b = idx[start:start + mb]
-                dist, value = self.net.distribution(obs[b], masks[b])
-                logp = dist.log_prob(actions[b])
-                ratio = torch.exp(logp - old_logp[b])
-                surr1 = ratio * adv[b]
-                surr2 = torch.clamp(ratio, 1 - self.cfg.drl.clip_eps,
-                                    1 + self.cfg.drl.clip_eps) * adv[b]
-                policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = ((value - returns[b]) ** 2).mean()
-                entropy = dist.entropy().mean()
-                loss = (policy_loss
-                        + self.cfg.drl.value_coef * value_loss
-                        - self.cfg.drl.entropy_coef * entropy)
-                self.opt.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)
-                self.opt.step()
+            with tf.GradientTape() as tape:
+                v = tf.squeeze(self.critic(states), axis=1)
+                critic_loss = tf.reduce_mean((returns - v) ** 2)
+            grads = tape.gradient(critic_loss, self.critic.trainable_variables)
+            self.critic_opt.apply_gradients(
+                zip(grads, self.critic.trainable_variables))
+            critic_losses.append(float(critic_loss))
 
-                stats["policy_loss"] += float(policy_loss.item())
-                stats["value_loss"] += float(value_loss.item())
-                stats["entropy"] += float(entropy.item())
-                stats["n"] += 1
+        self._buffer.clear()
+        return np.mean(actor_losses), np.mean(critic_losses)
 
-        k = max(stats["n"], 1)
-        return {"policy_loss": stats["policy_loss"] / k,
-                "value_loss": stats["value_loss"] / k,
-                "entropy": stats["entropy"] / k}
+    # ------------------------------------------------------- checkpointing -
+    def save(self, prefix):
+        self.actor.save(prefix + "_actor.keras")
+        self.critic.save(prefix + "_critic.keras")
 
-    def save(self, path):
-        torch.save(self.net.state_dict(), path)
-
-    def load(self, path):
-        self.net.load_state_dict(torch.load(path, map_location=self.device))
+    def load(self, prefix):
+        self.actor = tf.keras.models.load_model(prefix + "_actor.keras")
+        self.critic = tf.keras.models.load_model(prefix + "_critic.keras")

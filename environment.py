@@ -1,221 +1,500 @@
-"""
-DRL environment design (Section 9 of implementation_v2).
-
-State space (compact per-path, per-core features - not raw occupancy matrices):
-  for each candidate route and each core: the start index and size of the first
-  available slot block, the total available slots, the mean block size, and the
-  DC slots required on that route. Plus a request descriptor: source/destination
-  (one-hot) and the three channel requirements.
-
-Action space (a single flattened discrete action, factored as):
-  * route selection      - which of the K candidate routes,
-  * quantum-core selection - which core in C_Q,
-  * spectrum fit         - first / best / random fit for QC, CC and DC.
-
-Action masking: infeasible (route, core) options - those that cannot host the
-quantum channel under the XT-avoided mask and the spectrum constraints - are
-zeroed before the policy output, so every executed allocation is feasible.
-
-Reward: +1 for a fully served triplet (QC, CC and DC), -1 for a blocked request.
-"""
-
-import heapq
 import itertools
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 
-from allocator import allocate, qc_route_core_feasible
-from config import Config
-from modulation import ModulationSelector
-from spectrum import Allocation, SpectrumState
-from topology import Path, Topology
-from traffic import Request, TrafficGenerator
-
-FEATURES_PER_PATH_CORE = 5      # start, size, total_avail, mean_block, dc_slots
+import mcf_resources as mr
+from traffic import dc_slot_count
 
 
-class QKDSSEONEnv:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.topo = Topology(cfg.net.topology, cfg.net.num_cores,
-                             cfg.xt.adjacency_layout)
-        self.spectrum = SpectrumState(self.topo, cfg.net.slots_per_core,
-                                      cfg.alloc.guard_band, cfg.seed)
-        self.modsel = ModulationSelector(cfg.mod)
-        self.traffic = TrafficGenerator(
-            self.topo.num_nodes, cfg.req.capacity_classes,
-            cfg.req.arrival_rate, cfg.req.mean_holding_time, cfg.seed)
+FIT_STRATEGIES = ["first", "best", "random"]
 
-        self.K = cfg.alloc.k_paths
-        self.n_cores = cfg.net.num_cores
-        self.n_qcores = len(cfg.net.quantum_cores)
-        self.n_fits = len(cfg.drl.fit_strategies)
+ALPHA_HOPS = 1.0
+BETA_FRAG = 1.0
 
-        # Flattened action factors: (route, q_core, fit_qc, fit_cc, fit_dc).
-        self._action_factors = (self.K, self.n_qcores,
-                                self.n_fits, self.n_fits, self.n_fits)
-        self.action_dim = int(np.prod(self._action_factors))
-        self.obs_dim = (self.K * self.n_cores * FEATURES_PER_PATH_CORE
-                        + 2 * self.topo.num_nodes + 3)
+FEATURES_PER_PATH_CORE = 5
 
-        # Active lightpaths, as a heap keyed by departure time.
-        self._active: List[Tuple[float, int, List[Allocation]]] = []
-        self._counter = itertools.count()  # tie-breaker for the heap
-        self.current_request: Optional[Request] = None
-        self._candidate_routes: List[Path] = []
-        self._served = 0
-        self._blocked = 0
-        self._step_in_episode = 0
 
-    # ---- action (de)coding ---------------------------------------------------
-    def decode_action(self, flat: int) -> Tuple[int, int, str, str, str]:
-        route, q_idx, f_qc, f_cc, f_dc = np.unravel_index(
-            flat, self._action_factors)
-        fits = self.cfg.drl.fit_strategies
-        q_core = self.cfg.net.quantum_cores[int(q_idx)]
-        return (int(route), q_core, fits[int(f_qc)], fits[int(f_cc)], fits[int(f_dc)])
+class QKDEnvironment:
 
-    def action_mask(self) -> np.ndarray:
-        """Boolean mask over the flattened action space. A (route, q_core)
-        pair is feasible iff a quantum channel could be placed there."""
-        mask = np.zeros(self.action_dim, dtype=bool)
-        feasible_rc = np.zeros((self.K, self.n_qcores), dtype=bool)
-        for r in range(self.K):
-            if r >= len(self._candidate_routes):
-                continue
-            route = self._candidate_routes[r]
-            for qi, q_core in enumerate(self.cfg.net.quantum_cores):
-                feasible_rc[r, qi] = qc_route_core_feasible(
-                    self.spectrum, self.topo, route, q_core, self.cfg)
-        # Expand to all fit combinations.
-        for r in range(self.K):
-            for qi in range(self.n_qcores):
-                if not feasible_rc[r, qi]:
+    def __init__(self, network, traffic_gen,
+                 k_paths=5,
+                 total_requests=100000,num_training_slots=250):
+
+        self.net = network
+        self.traffic = traffic_gen
+        self.k = k_paths
+        self.total_requests = total_requests
+        self.num_training_slots = num_training_slots
+        # self.max_training_slots = 100
+
+        self.slot_table = mr.build_slot_table(
+            self.net.num_links,
+            self.net.cores_per_link,
+            self.net.slots_per_core
+        )
+
+        self.active = {}
+
+        self.action_table = list(
+            itertools.product(
+                range(self.k),
+                range(len(self.net.quantum_cores)),
+                range(len(FIT_STRATEGIES)),
+                range(len(FIT_STRATEGIES)),
+                range(len(FIT_STRATEGIES))
+            )
+        )
+
+        self.action_size = len(self.action_table)
+
+        n = len(self.net.nodes)
+
+        self.state_size = (
+            self.k *
+            self.net.cores_per_link *
+            FEATURES_PER_PATH_CORE
+            + 2 * n
+            + 3
+        )
+
+        self._request_iter = None
+        self._reset_iter()
+
+    # -------------------------------------------------
+
+    def _reset_iter(self):
+        self._request_iter = self.traffic.generate(
+            self.total_requests
+        )
+
+    # -------------------------------------------------
+
+    def _candidate_routes(self, request):
+        return self.net.k_shortest_paths(
+            request["src"],
+            request["dst"],
+            self.k
+        )
+
+    # -------------------------------------------------
+
+    def _dc_slots_for_route(self, request, link_ids):
+        return dc_slot_count(
+            request["demand"],
+            self.net.path_distance(link_ids)
+        )
+
+    # =================================================
+    # STATE
+    # =================================================
+
+    def build_state(self, request, routes):
+
+        n = len(self.net.nodes)
+
+        S = self.net.slots_per_core
+
+        feats = []
+
+        for r in range(self.k):
+
+            if r < len(routes):
+                link_ids = routes[r]
+                dc_slots = self._dc_slots_for_route(
+                    request,
+                    link_ids
+                )
+            else:
+                link_ids = None
+                dc_slots = 0
+
+            for core in range(
+                    self.net.cores_per_link):
+
+                if link_ids is None:
+                    feats.extend([0, 0, 0, 0, 0])
                     continue
-                for f1 in range(self.n_fits):
-                    for f2 in range(self.n_fits):
-                        for f3 in range(self.n_fits):
-                            flat = np.ravel_multi_index(
-                                (r, qi, f1, f2, f3), self._action_factors)
-                            mask[flat] = True
+
+                occ = mr.feasible_occupancy(
+                    self.slot_table,
+                    link_ids,
+                    core,
+                    self.net.core_adjacency,
+                    self.num_training_slots
+
+                )
+
+                blocks = mr.free_blocks(occ)
+
+                if blocks:
+
+                    first_start = blocks[0][0]
+
+                    first_size = len(blocks[0])
+
+                    total_avail = sum(
+                        len(b)
+                        for b in blocks
+                    )
+
+                    mean_size = (
+                        total_avail /
+                        len(blocks)
+                    )
+
+                else:
+
+                    first_start = 0
+                    first_size = 0
+                    total_avail = 0
+                    mean_size = 0
+
+                feats.extend([
+                    first_start / S,
+                    first_size / S,
+                    total_avail / S,
+                    mean_size / S,
+                    dc_slots / S
+                ])
+
+        src_oh = [0] * n
+        dst_oh = [0] * n
+
+        src_oh[
+            self.net.nodes.index(
+                request["src"])
+        ] = 1
+
+        dst_oh[
+            self.net.nodes.index(
+                request["dst"])
+        ] = 1
+
+        descriptor = src_oh + dst_oh + [
+
+            request["qc_slots"],
+
+            request["cc_slots"],
+
+            self._dc_slots_for_route(
+                request,
+                routes[0]
+            ) / S if routes else 0
+        ]
+
+        return np.asarray(
+            feats + descriptor,
+            dtype=np.float32
+        )
+
+    # =================================================
+    # ACTION MASK
+    # =================================================
+
+    def action_mask(self, request, routes):
+
+        mask = np.zeros(
+            self.action_size,
+            dtype=np.float32
+        )
+
+        for a, (ri, qci, _, _, _) in enumerate(
+                self.action_table):
+
+            if ri >= len(routes):
+                continue
+
+            qc_route = routes[ri]
+
+            qcore = self.net.quantum_cores[qci]
+
+            occ = mr.feasible_occupancy(
+                self.slot_table,
+                qc_route,
+                qcore,
+                self.net.core_adjacency,
+                self.num_training_slots
+            )
+
+            if not mr._candidate_blocks(
+                    occ,
+                    request["qc_slots"]):
+                continue
+
+            disjoint = [
+                r for r in routes
+                if self.net.link_disjoint(
+                    r,
+                    qc_route
+                )
+            ]
+
+            if len(disjoint) == 0:
+                continue
+
+            mask[a] = 1.0
+
         return mask
 
-    # ---- observation ---------------------------------------------------------
-    def _path_core_features(self, route: Optional[Path], core: int,
-                            dc_slots: int) -> List[float]:
-        S = self.cfg.net.slots_per_core
-        if route is None:
-            return [-1.0] * FEATURES_PER_PATH_CORE
-        avail = self.spectrum.availability_mask(route, core)
-        runs = SpectrumState._run_lengths(avail)
-        # first available block
-        first_start, first_size = -1, 0
-        idx = np.flatnonzero(avail)
-        if idx.size > 0:
-            first_start = int(idx[0])
-            first_size = int(runs[first_start])
-        total_avail = int(avail.sum())
-        # mean block size over the free blocks
-        block_sizes = [runs[i] for i in range(S)
-                       if avail[i] and (i == 0 or not avail[i - 1])]
-        mean_block = float(np.mean(block_sizes)) if block_sizes else 0.0
-        return [first_start / S, first_size / S, total_avail / S,
-                mean_block / S, dc_slots / S]
+    # =================================================
+    # FRAGMENTATION
+    # =================================================
 
-    def _observation(self) -> np.ndarray:
-        S = self.cfg.net.slots_per_core
-        feats: List[float] = []
-        for r in range(self.K):
-            route = self._candidate_routes[r] if r < len(self._candidate_routes) else None
-            if route is not None:
-                sel = self.modsel.select(self.topo.path_length(route),
-                                         self.current_request.demand)
-                dc_slots = sel[2] if sel else 0
+    def _route_fragmentation(self, link_ids):
+
+        ratios = []
+
+        for core in self.net.data_cores:
+
+            occ = mr.route_core_occupancy(
+                self.slot_table,
+                link_ids,
+                core
+            )
+
+            blocks = mr.free_blocks(occ)
+
+            total_free = sum(
+                len(b)
+                for b in blocks
+            )
+
+            if total_free == 0:
+                ratios.append(0.0)
+
             else:
-                dc_slots = 0
-            for c in range(self.n_cores):
-                feats.extend(self._path_core_features(route, c, dc_slots))
+                ratios.append(
+                    1.0 -
+                    max(len(b) for b in blocks)
+                    / total_free
+                )
 
-        # request descriptor: src/dst one-hot + three channel requirements
-        src_oh = np.zeros(self.topo.num_nodes)
-        dst_oh = np.zeros(self.topo.num_nodes)
-        src_oh[self.current_request.src] = 1.0
-        dst_oh[self.current_request.dst] = 1.0
-        # DC requirement taken on the shortest candidate route.
-        if self._candidate_routes:
-            sel = self.modsel.select(
-                self.topo.path_length(self._candidate_routes[0]),
-                self.current_request.demand)
-            dc_req = (sel[2] / S) if sel else 0.0
-        else:
-            dc_req = 0.0
-        descriptor = [1.0 / S, 1.0 / S, dc_req]      # QC, CC, DC requirements
-        return np.concatenate([np.asarray(feats, dtype=np.float32),
-                               src_oh, dst_oh,
-                               np.asarray(descriptor, dtype=np.float32)]).astype(np.float32)
+        return (
+            sum(ratios) / len(ratios)
+            if ratios else 0.0
+        )
 
-    # ---- simulation bookkeeping ---------------------------------------------
-    def _release_expired(self, now: float):
-        while self._active and self._active[0][0] <= now:
-            _, _, allocs = heapq.heappop(self._active)
-            self.spectrum.release_all(allocs)
+    # =================================================
 
-    def _fetch_next_request(self):
-        self.current_request = self.traffic.next_request()
-        self._release_expired(self.current_request.arrival_time)
-        self._candidate_routes = list(self.topo.k_shortest_paths(
-            self.current_request.src, self.current_request.dst, self.K))
+    def _allocate_channel(
+            self,
+            link_ids,
+            cores,
+            required,
+            strategy):
 
-    # ---- gym-style API -------------------------------------------------------
-    def reset(self, seed: Optional[int] = None) -> np.ndarray:
-        if seed is not None:
-            self.cfg.seed = seed
-        self.spectrum.reset(seed)
-        self.traffic.reset(seed)
-        self._active = []
-        self._served = 0
-        self._blocked = 0
-        self._step_in_episode = 0
-        self._fetch_next_request()
-        return self._observation()
+        for core in cores:
 
-    def step(self, flat_action: int):
-        route_idx, q_core, f_qc, f_cc, f_dc = self.decode_action(flat_action)
-        result = allocate(self.spectrum, self.topo, self.modsel, self.cfg,
-                          self.current_request, self._candidate_routes,
-                          route_idx, q_core, f_qc, f_cc, f_dc)
+            occ = mr.feasible_occupancy(
+                self.slot_table,
+                link_ids,
+                core,
+                self.net.core_adjacency,
+                self.num_training_slots
+            )
 
-        if result.success:
-            reward = 1.0
-            self._served += 1
-            heapq.heappush(self._active,
-                           (self.current_request.departure_time,
-                            next(self._counter), result.allocations))
-        else:
-            reward = -1.0
-            self._blocked += 1
+            start = mr.select_start(
+                occ,
+                required,
+                strategy
+            )
 
-        self._step_in_episode += 1
-        done = self._step_in_episode >= self.cfg.drl.episode_length
+            if start is not None:
+
+                idx = mr.occupy(
+                    self.slot_table,
+                    link_ids,
+                    core,
+                    start,
+                    required
+                )
+
+                return core, idx
+
+        return None, None
+
+    # =================================================
+    # STEP
+    # =================================================
+
+    def step(self, request, routes, action):
+
+        ri, qci, qc_fit, cc_fit, dc_fit = \
+            self.action_table[action]
 
         info = {
-            "success": result.success,
-            "blocked_reason": result.blocked_reason,
-            "utilization": self.spectrum.utilization(),
-            "fragmentation": self.spectrum.external_fragmentation(),
+            "served": False,
+            "reason": None
         }
 
-        self._fetch_next_request()        # advance to the next arrival
-        return self._observation(), reward, done, info
+        if ri >= len(routes):
+            return -1.0, True, info
 
-    # ---- metrics (Section 11) -----------------------------------------------
-    @property
-    def blocking_probability(self) -> float:
-        total = self._served + self._blocked
-        return self._blocked / total if total else 0.0
+        qc_route = routes[ri]
 
-    @property
-    def triplet_success_rate(self) -> float:
-        total = self._served + self._blocked
-        return self._served / total if total else 0.0
+        placed = []
+
+        # ---------------- QC ----------------
+
+        qcore = self.net.quantum_cores[qci]
+
+        core, idx = self._allocate_channel(
+            qc_route,
+            [qcore],
+            request["qc_slots"],
+            FIT_STRATEGIES[qc_fit]
+        )
+
+        if core is None:
+            info["reason"] = "qc"
+            return -1.0, True, info
+
+        placed.append(
+            (qc_route, core, idx)
+        )
+
+        # ---------------- CC ----------------
+
+        cc_cores = list(
+            self.net.data_cores
+        )
+
+        core, idx = self._allocate_channel(
+            qc_route,
+            cc_cores,
+            request["cc_slots"],
+            FIT_STRATEGIES[cc_fit]
+        )
+
+        if core is None:
+
+            self._rollback(placed)
+
+            info["reason"] = "cc"
+
+            return -1.0, True, info
+
+        placed.append(
+            (qc_route, core, idx)
+        )
+
+        # ---------------- DC ----------------
+
+        disjoint = [
+
+            r for r in routes
+
+            if self.net.link_disjoint(
+                r,
+                qc_route
+            )
+        ]
+
+        if len(disjoint) == 0:
+
+            self._rollback(placed)
+
+            info["reason"] = "disjoint"
+
+            return -1.0, True, info
+
+        dc_route = min(
+            disjoint,
+
+            key=lambda r:
+
+            ALPHA_HOPS * len(r)
+
+            + BETA_FRAG *
+            self._route_fragmentation(r)
+        )
+
+        dc_slots = self._dc_slots_for_route(
+            request,
+            dc_route
+        )
+
+        core, idx = self._allocate_channel(
+            dc_route,
+            list(self.net.data_cores),
+            dc_slots,
+            FIT_STRATEGIES[dc_fit]
+        )
+
+        if core is None:
+
+            self._rollback(placed)
+
+            info["reason"] = "dc"
+
+            return -1.0, True, info
+
+        placed.append(
+            (dc_route, core, idx)
+        )
+
+        self.active[
+            request["id"]
+        ] = {
+
+            "release_time":
+            request["arrival"]
+            + request["holding"],
+
+            "placements":
+            placed
+        }
+
+        info["served"] = True
+        info["reason"] = "success"
+
+        return 1.0, False, info
+
+    # =================================================
+
+    def _rollback(self, placed):
+
+        for link_ids, core, idx in placed:
+
+            mr.release(
+                self.slot_table,
+                link_ids,
+                core,
+                idx
+            )
+
+    # =================================================
+
+    def release_expired(self, current_time):
+
+        for rid in list(self.active):
+
+            if current_time >= \
+                    self.active[rid]["release_time"]:
+
+                for link_ids, core, idx in \
+                        self.active[rid]["placements"]:
+
+                    mr.release(
+                        self.slot_table,
+                        link_ids,
+                        core,
+                        idx
+                    )
+
+                del self.active[rid]
+
+    # =================================================
+
+    def reset(self):
+
+        mr.reset_slot_table(
+            self.slot_table
+        )
+
+        self.active.clear()
+
+        self._reset_iter()
+
+
+
+

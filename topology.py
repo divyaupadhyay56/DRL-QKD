@@ -1,126 +1,153 @@
 """
-Network model (Section 2 of implementation_v2).
+topology.py
+===========
+Network model for the QKD-enabled SS-EON over multi-core fiber (MCF).
 
-- The optical network is a *directed* graph: nodes are optical cross-connects,
-  links are multi-core-fiber connections.
-- An inter-core adjacency matrix describes which cores are physically
-  neighbouring (used for the XT-avoided crosstalk relationships). The matrix is
-  built so it can later be extended with an inter-mode dimension.
-- K-shortest paths are computed per source-destination pair (Section 7).
+Implements Section 2 ("Network Model") of implementation_v2:
+  - Network = Tokyo12 MAN network (12 optical cross-connect nodes).
+  - Directed graph; links are multi-core fiber connections.
+  - Inter-core adjacency matrix describing which cores are physically
+    neighbouring (used for crosstalk relationships). Scope hook is left to
+    extend with an inter-mode crosstalk dimension (single mode per core here,
+    so every core is purely a spatial channel).
+  - 5 cores per link, 2 quantum-dedicated cores (set C_Q), 320 slots per core.
+
+References (uploaded by the user):
+  - implementation_v2.docx ....... authoritative specification (Sections 2, 6).
+  - graph_functions.py ........... user's networkGraph / k-shortest-path code
+                                   (this file extends that pattern to MCF).
+  - DeepRMSA_Aorks_2.pdf ......... DeepRMSA (graph + k-SP routing reference).
+  - IET_Quantum_Communication_2023_Sharma .. DRL routing/resource assignment
+                                   in quantum networks (topology reference).
+  - shrasti_noms2026_qkd_1.pdf ... NOMS-2026 QKD routing paper (QKD core model).
+
+NOTE ON DISTANCES: the Tokyo12 / Japanese 12-node (JPN12) link set below is the
+standard metropolitan backbone used in the literature. Replace the km values in
+`TOKYO12_LINKS` with your exact Tokyo12 distance matrix if it differs; the rest
+of the code reads them from here and needs no other change.
 """
 
-from functools import lru_cache
-from typing import Dict, List, Tuple
-
 import networkx as nx
-import numpy as np
-
-Edge = Tuple[int, int]          # a directed link (u, v)
-Path = List[Edge]               # an ordered list of directed links
 
 
 # ---------------------------------------------------------------------------
-# Topology definitions
+# Section 2: Concrete MCF setup (exact values from implementation_v2)
 # ---------------------------------------------------------------------------
-# 6-node network used for MILP-optimal validation (Xav-RQCD Fig.3(a)):
-# eight bidirectional links with lengths {500,700,600,400,450,500,450,400} km.
-_SIXNODE_LINKS = [
-    (0, 1, 500.0), (1, 2, 700.0), (2, 3, 600.0), (3, 4, 400.0),
-    (4, 5, 450.0), (5, 0, 500.0), (0, 2, 450.0), (3, 5, 400.0),
+CORES_PER_LINK = 5          # 5 cores per link
+SLOTS_PER_CORE = 320        # 320 frequency slots per core
+QUANTUM_CORES = (0, 1)      # set C_Q: 2 quantum-dedicated cores
+DATA_CORES = (2, 3, 4)      # remaining, non-quantum cores (CC and DC)
+
+
+# ---------------------------------------------------------------------------
+# Tokyo12 MAN network: 12 nodes, bidirectional fiber links with length (km).
+# (Standard Japanese 12-node backbone link set.)
+# ---------------------------------------------------------------------------
+TOKYO12_NODES = list(range(12))
+
+TOKYO12_LINKS = [
+    (0, 1, 593), (0, 2, 1256),
+    (1, 2, 351), (1, 3, 47),
+    (2, 4, 250), (2, 5, 252),
+    (3, 4, 252), (3, 6, 314),
+    (4, 7, 224), (5, 7, 207),
+    (5, 8, 350), (6, 7, 268),
+    (6, 9, 191), (7, 8, 263),
+    (7, 10, 311), (8, 11, 247),
+    (9, 10, 260), (10, 11, 296),
 ]
 
-# Tokyo12 metropolitan-area network (the topology in networks.pdf, diagram (b)).
-# Read directly from the figure: 12 nodes, 21 bidirectional links, lengths in km.
-# The figure labels nodes 1..12; here node index = figure_label - 1.
-# (u, v, km) with u, v as zero-based indices:
-_TOKYO12_LINKS = [
-    (0, 2, 6.2),   (2, 4, 6.7),   (2, 3, 7.1),   (0, 3, 7.5),   (0, 1, 10.5),
-    (4, 9, 10.1),  (9, 11, 10.5), (4, 5, 1.9),   (5, 11, 11.5), (5, 10, 7.0),
-    (10, 11, 7.6), (3, 5, 5.0),   (3, 6, 7.1),   (5, 6, 5.0),   (1, 3, 8.0),
-    (1, 6, 10.3),  (6, 10, 7.5),  (1, 7, 9.1),   (1, 8, 12.4),  (6, 7, 6.7),
-    (7, 8, 6.0),
-]
 
-_TOPOLOGIES = {
-    "sixnode": _SIXNODE_LINKS,
-    "tokyo12": _TOKYO12_LINKS,
-}
+def inter_core_adjacency(num_cores=CORES_PER_LINK):
+    """Section 2/6: inter-core adjacency matrix.
+
+    Returns a num_cores x num_cores 0/1 matrix where entry (i, j) == 1 means
+    cores i and j are physically neighbouring on the same link and therefore
+    constrained by the XT-avoided rule (Section 6). A standard 5-core layout
+    is one central core (4) adjacent to the four outer cores (0..3) arranged in
+    a ring, so each outer core neighbours the centre and its two ring
+    neighbours. Edit this matrix to match a different physical core layout.
+
+    Scope hook: extend with an inter-mode dimension here when moving beyond the
+    single-mode-per-core assumption.
+    """
+    adj = [[0] * num_cores for _ in range(num_cores)]
+    if num_cores == 5:
+        neighbours = {
+            0: [1, 3, 4],
+            1: [0, 2, 4],
+            2: [1, 3, 4],
+            3: [0, 2, 4],
+            4: [0, 1, 2, 3],
+        }
+        for c, nbrs in neighbours.items():
+            for n in nbrs:
+                adj[c][n] = 1
+    else:
+        # Fallback: linear nearest-neighbour adjacency.
+        for c in range(num_cores - 1):
+            adj[c][c + 1] = 1
+            adj[c + 1][c] = 1
+    return adj
 
 
-class Topology:
-    """Directed MCF graph plus the inter-core adjacency matrix."""
+class MCFNetwork:
+    """Multi-core-fiber network graph.
 
-    def __init__(self, name: str, num_cores: int, adjacency_layout: str = "ring"):
-        if name not in _TOPOLOGIES:
-            raise ValueError(f"unknown topology '{name}'")
-        self.name = name
-        self.num_cores = num_cores
+    Mirrors the role of `networkGraph` in the user's graph_functions.py
+    (node list, indexed edge list, k-shortest paths, path distances) but adds
+    the MCF dimension: every directed link owns CORES_PER_LINK cores, and the
+    spectrum state is held per (link, core).
+    """
 
-        # Build a directed graph (each undirected fiber becomes two links).
-        self.graph = nx.DiGraph()
-        for u, v, km in _TOPOLOGIES[name]:
-            self.graph.add_edge(u, v, length=km)
-            self.graph.add_edge(v, u, length=km)
+    def __init__(self, nodes=None, links=None,
+                 cores_per_link=CORES_PER_LINK,
+                 slots_per_core=SLOTS_PER_CORE,
+                 quantum_cores=QUANTUM_CORES,
+                 data_cores=DATA_CORES):
+        self.cores_per_link = cores_per_link
+        self.slots_per_core = slots_per_core
+        self.quantum_cores = tuple(quantum_cores)
+        self.data_cores = tuple(data_cores)
+        self.core_adjacency = inter_core_adjacency(cores_per_link)
 
-        self.nodes = sorted(self.graph.nodes())
-        self.num_nodes = len(self.nodes)
+        nodes = TOKYO12_NODES if nodes is None else nodes
+        links = TOKYO12_LINKS if links is None else links
 
-        # Stable indexing of directed links.
-        self.edges: List[Edge] = sorted(self.graph.edges())
-        self.edge_index: Dict[Edge, int] = {e: i for i, e in enumerate(self.edges)}
-        self.num_edges = len(self.edges)
+        # Directed graph (Section 2: model as a directed graph).
+        self.g = nx.DiGraph()
+        self.g.add_nodes_from(nodes)
+        for u, v, dist in links:
+            self.g.add_edge(u, v, weight=dist)
+            self.g.add_edge(v, u, weight=dist)
 
-        self.core_adjacency = self._build_core_adjacency(adjacency_layout)
+        self.nodes = list(self.g.nodes)
+        self.edges = list(self.g.edges)                  # indexed directed links
+        self.edge_index = {e: i for i, e in enumerate(self.edges)}
+        self.num_links = len(self.edges)
 
-    # ---- inter-core adjacency ------------------------------------------------
-    def _build_core_adjacency(self, layout: str) -> np.ndarray:
-        """Binary matrix: A[i, j] = 1 if cores i and j are physical neighbours.
+    # --- routing (same idea as graph_functions.findPaths / findDistances) ----
+    def k_shortest_paths(self, source, destination, k):
+        """K candidate routes as ordered lists of directed-link indices.
 
-        For a 5-core fiber the layout is a ring (Xav-RQCD Fig.2(b)):
-        core i neighbours i-1 and i+1 (mod num_cores). The matrix is the hook
-        for an eventual inter-mode extension.
+        Section 7: "Compute K candidate routes (K-shortest paths) ... (k upto 8)."
         """
-        n = self.num_cores
-        A = np.zeros((n, n), dtype=np.int8)
-        if layout == "ring":
-            for i in range(n):
-                A[i, (i + 1) % n] = 1
-                A[i, (i - 1) % n] = 1
-        elif layout == "linear":
-            for i in range(n - 1):
-                A[i, i + 1] = 1
-                A[i + 1, i] = 1
-        else:
-            raise ValueError(f"unknown adjacency layout '{layout}'")
-        return A
-
-    def adjacent_cores(self, core: int) -> List[int]:
-        return [c for c in range(self.num_cores) if self.core_adjacency[core, c]]
-
-    # ---- routing -------------------------------------------------------------
-    @lru_cache(maxsize=None)
-    def k_shortest_paths(self, src: int, dst: int, k: int) -> Tuple[Path, ...]:
-        """Return up to k length-shortest simple paths as ordered edge lists."""
-        if src == dst:
-            return tuple()
-        gen = nx.shortest_simple_paths(self.graph, src, dst, weight="length")
-        paths: List[Path] = []
-        for node_path in gen:
-            edge_path = list(zip(node_path[:-1], node_path[1:]))
-            paths.append(edge_path)
-            if len(paths) >= k:
+        paths = nx.shortest_simple_paths(self.g, source, destination,
+                                         weight="weight")
+        ksp = []
+        for number, node_path in enumerate(paths):
+            link_ids = [self.edge_index[(node_path[i], node_path[i + 1])]
+                        for i in range(len(node_path) - 1)]
+            ksp.append(link_ids)
+            if number == k - 1:
                 break
-        return tuple(paths)
+        return ksp
 
-    def path_length(self, path: Path) -> float:
-        return sum(self.graph[u][v]["length"] for (u, v) in path)
-
-    def path_hops(self, path: Path) -> int:
-        return len(path)
+    def path_distance(self, link_ids):
+        """Total length (km) of a route given as link indices."""
+        return sum(self.g.edges[self.edges[lid]]["weight"] for lid in link_ids)
 
     @staticmethod
-    def link_disjoint(path_a: Path, path_b: Path) -> bool:
-        """True if the two paths share no link (Section 3: DC must be
-        link-disjoint from the QC/CC route)."""
-        sa = set(path_a)
-        return all(e not in sa for e in path_b)
+    def link_disjoint(path_a, path_b):
+        """Section 3/7: DC must be link-disjoint from the QC/CC route."""
+        return len(set(path_a) & set(path_b)) == 0
