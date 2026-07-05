@@ -2,7 +2,6 @@ import random
 
 GUARD_BAND = 1
 
-
 # ==========================================================
 # SLOT TABLE
 # ==========================================================
@@ -130,7 +129,6 @@ def feasible_occupancy(slot_table,
 
     return result
 
-
 # ==========================================================
 # CANDIDATE BLOCKS
 # ==========================================================
@@ -145,49 +143,10 @@ def _candidate_blocks(occupancy, required):
     ]
 
 
-# ==========================================================
-# FIT STRATEGIES
-# ==========================================================
-def select_start(occupancy,
-                 required,
-                 strategy):
-
-    blocks = _candidate_blocks(
-        occupancy,
-        required
-    )
-
-    if not blocks:
-        return None
-
-    if strategy == "first":
-        return blocks[0][0]
-
-    if strategy == "best":
-
-        best = min(
-            blocks,
-            key=lambda b: (len(b), b[0])
-        )
-
-        return best[0]
-
-    if strategy == "random":
-
-        chosen = random.choice(blocks)
-
-        max_offset = (
-            len(chosen)
-            - (required + GUARD_BAND)
-        )
-
-        return chosen[
-            random.randint(0, max_offset)
-        ]
-
-    raise ValueError(
-        "Unknown strategy"
-    )
+def candidate_blocks(occupancy, required):
+    """Public API: all feasible free spectrum blocks, i.e. every
+    contiguous free block whose size >= required + GUARD_BAND."""
+    return _candidate_blocks(occupancy, required)
 
 
 # ==========================================================

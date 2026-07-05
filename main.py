@@ -1,10 +1,12 @@
 import numpy as np
 import pandas as pd
+from collections import Counter
 
 from topology import MCFNetwork
 from traffic import TrafficGenerator
 from environment import QKDEnvironment
 from ppo_agent import PPOAgent
+import mcf_resources as mr
 
 # ---------------------------------------------------------
 # Simulation configuration
@@ -13,14 +15,14 @@ K_PATHS = 15
 
 HOLDING_MEAN = 6.0
 
-LOADS = [48, 60, 90, 120, 150]
+LOADS = [90, 120, 150]
 
 EPISODE_SIZE = 1500
 NUM_TRAINING_SLOTS = 250
 
-OFFLINE_EPISODES = 500
-ONLINE_EPISODES = 200
-EVAL_EPISODES = 50
+OFFLINE_EPISODES = 1000
+ONLINE_EPISODES = 1000
+EVAL_EPISODES = 500
 
 
 def run_episode(env, agent, episode_seed, training=True):
@@ -31,6 +33,8 @@ def run_episode(env, agent, episode_seed, training=True):
 
     blocked = 0
     served = 0
+
+    block_reasons = Counter()
 
     frag_samples = []
     util_samples = []
@@ -48,15 +52,19 @@ def run_episode(env, agent, episode_seed, training=True):
 
         if not routes:
             blocked += 1
+            block_reasons["route"] += 1
             rewards.append(-1.0)
             continue
 
-        state = env.build_state(req, routes)
+        state = env.build_state(req, routes)       # it gives information of Network and available free blocks to PPO.
 
-        mask = env.action_mask(req, routes)
+        mask = env.action_mask(req, routes)  #It informs PPO which blocks are valid for this request and which ones cannot be selected at all.
 
         if mask.sum() == 0:
             blocked += 1
+            block_reasons[
+                env.mask_block_reason(req, routes)
+            ] += 1
             rewards.append(-1.0)
             continue
 
@@ -90,8 +98,7 @@ def run_episode(env, agent, episode_seed, training=True):
 
         if is_blocked:
             blocked += 1
-
-        import mcf_resources as mr
+            block_reasons[info["block_reason"]] += 1
 
         frag_samples.append(
             mr.external_fragmentation(
@@ -127,6 +134,13 @@ def run_episode(env, agent, episode_seed, training=True):
         "mean_reward":
             float(np.mean(rewards))
             if rewards else 0.0,
+
+        "blocked_route": block_reasons["route"] / n,
+        "blocked_qc": block_reasons["qc"] / n,
+        "blocked_cc": block_reasons["cc"] / n,
+        "blocked_dc": block_reasons["dc"] / n,
+        "blocked_combination":
+            block_reasons["combination"] / n,
     }
 
 
@@ -141,6 +155,11 @@ def main():
         "utilisation": [],
         "qkd_success_rate": [],
         "mean_reward": [],
+        "blocked_route": [],
+        "blocked_qc": [],
+        "blocked_cc": [],
+        "blocked_dc": [],
+        "blocked_combination": [],
     }
 
     for load in LOADS:
@@ -191,7 +210,12 @@ def main():
                 "fragmentation",
                 "utilisation",
                 "qkd_success_rate",
-                "mean_reward"
+                "mean_reward",
+                "blocked_route",
+                "blocked_qc",
+                "blocked_cc",
+                "blocked_dc",
+                "blocked_combination"
             ):
                 history[key].append(m[key])
 
@@ -281,5 +305,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
