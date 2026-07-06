@@ -12,6 +12,7 @@ import mcf_resources as mr
 # Simulation configuration
 # ---------------------------------------------------------
 K_PATHS = 15
+J_BLOCKS = 3          # candidate free blocks per channel
 
 HOLDING_MEAN = 6.0
 
@@ -20,10 +21,9 @@ LOADS = [90, 120, 150]
 EPISODE_SIZE = 1500
 NUM_TRAINING_SLOTS = 250
 
-OFFLINE_EPISODES = 1000
-ONLINE_EPISODES = 1000
-EVAL_EPISODES = 500
-
+OFFLINE_EPISODES = 10
+ONLINE_EPISODES = 10
+EVAL_EPISODES = 5
 
 def run_episode(env, agent, episode_seed, training=True):
 
@@ -162,6 +162,11 @@ def main():
         "blocked_combination": [],
     }
 
+    eval_summary = {
+        "load": [],
+        "avg_eval_fragmentation": [],
+    }
+
     for load in LOADS:
 
         arrival_rate = load / HOLDING_MEAN
@@ -179,7 +184,8 @@ def main():
             traffic,
             k_paths=K_PATHS,
             total_requests=EPISODE_SIZE,
-            num_training_slots=NUM_TRAINING_SLOTS
+            num_training_slots=NUM_TRAINING_SLOTS,
+            j_blocks=J_BLOCKS
         )
 
         agent = PPOAgent(
@@ -272,6 +278,8 @@ def main():
         # ---------------------------------------
         # Evaluation
         # ---------------------------------------
+        eval_frag = []
+
         for ep in range(1, EVAL_EPISODES + 1):
 
             m = run_episode(
@@ -287,12 +295,34 @@ def main():
                 m
             )
 
+            eval_frag.append(m["fragmentation"])
+
+        # Mean external fragmentation over ALL evaluation
+        # episodes for this load (not a single episode).
+        avg_eval_frag = float(np.mean(eval_frag))
+
+        eval_summary["load"].append(load)
+        eval_summary["avg_eval_fragmentation"].append(
+            avg_eval_frag
+        )
+
+        print(
+            f"\n>>> Load {load} Erlangs | mean external "
+            f"fragmentation over {EVAL_EPISODES} eval "
+            f"episodes = {avg_eval_frag:.4f}"
+        )
+
         agent.save(
             f"ppo_load_{load}"
         )
 
     pd.DataFrame(history).to_csv(
         "results.csv",
+        index=False
+    )
+
+    pd.DataFrame(eval_summary).to_csv(
+        "eval_fragmentation_summary.csv",
         index=False
     )
 
