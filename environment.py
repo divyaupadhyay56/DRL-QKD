@@ -212,6 +212,7 @@ class QKDEnvironment:
             "dc": {},        # ri -> feasible DC blocks
             "dc_route": {},  # ri -> DC route (or None)
             "dc_slots": {},  # ri -> DC slots required
+            
         }
 
         frag_memo = {}
@@ -221,6 +222,7 @@ class QKDEnvironment:
         for ri in range(min(self.k, len(routes))):
 
             qc_route = routes[ri]
+
 
             # route combination check (Flow: valid route?)
             dc_route = self._dc_route(
@@ -357,6 +359,7 @@ class QKDEnvironment:
                 cache["dc_slots"][ri] / S
             )
 
+           
         # global spectrum condition (from cache)
         feats.append(cache["frag"])
         feats.append(cache["util"])
@@ -571,7 +574,8 @@ class QKDEnvironment:
 
         info = {
             "served": False,
-            "block_reason": None
+            "block_reason": None,
+           
         }
 
         if ri >= len(routes):
@@ -667,6 +671,7 @@ class QKDEnvironment:
 
         info["served"] = True
         info["block_reason"] = "success"
+        
 
         return 1.0, False, info
 
